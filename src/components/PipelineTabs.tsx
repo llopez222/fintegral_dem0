@@ -9,7 +9,9 @@ interface PipelineTabsProps {
 }
 
 export function PipelineTabs({ activeView, onViewChange }: PipelineTabsProps) {
-  const { isManager } = useUser();
+  const { hasPermission } = useUser();
+  
+  const canViewDepartment = hasPermission('viewDepartmentPipeline');
 
   return (
     <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
@@ -21,7 +23,7 @@ export function PipelineTabs({ activeView, onViewChange }: PipelineTabsProps) {
       >
         My Pipeline
       </Button>
-      {isManager && (
+      {canViewDepartment && (
         <Button
           variant={activeView === 'department' ? 'default' : 'ghost'}
           size="sm"

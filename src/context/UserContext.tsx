@@ -1,15 +1,43 @@
 import { createContext, useContext, useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
-import type { ExtendedUser } from '@/mocks/users';
-import { mockUsers, getDefaultUser } from '@/mocks/users';
+import type { ExtendedUser, Permissions } from '@/mocks/users';
+import { mockUsers, authenticateUser, getUserById } from '@/mocks/users';
 
-interface UserContextType {
-  currentUser: ExtendedUser;
-  setCurrentUser: (user: ExtendedUser) => void;
-  isManager: boolean;
-  availableUsers: ExtendedUser[];
+// Storage keys
+const STORAGE_KEY_USER = 'fintegral_user';
+const STORAGE_KEY_IMPERSONATING = 'fintegral_impersonating';
+
+interface ImpersonationState {
+  isImpersonating: boolean;
+  originalUser: ExtendedUser | null;
 }
 
-const STORAGE_KEY = 'fintegral_current_user';
+interface UserContextType {
+  // User state
+  currentUser: ExtendedUser | null;
+  isAuthenticated: boolean;
+  
+  // Impersonation state
+  isImpersonating: boolean;
+  originalUser: ExtendedUser | null;
+  
+  // Actions
+  login: (email: string, password: string) => Promise<boolean>;
+  logout: () => void;
+  impersonate: (userId: string) => boolean;
+  stopImpersonating: () => void;
+  
+  // Permissions
+  hasPermission: (permission: keyof Permissions) => boolean;
+  canImpersonate: () => boolean;
+  
+  // Role checks - only 3 roles
+  isSuperAdmin: boolean;
+  isManager: boolean;
+  isLoanOfficer: boolean;
+  
+  // Available users (for switcher)
+  availableUsers: ExtendedUser[];
+}
 
 const UserContext = createContext<UserContextType | undefined>(undefined);
 
@@ -18,62 +46,187 @@ interface UserProviderProps {
 }
 
 export function UserProvider({ children }: UserProviderProps) {
-  const [currentUser, setCurrentUserState] = useState<ExtendedUser>(() => {
-    // Try to load from localStorage on init
-    if (typeof window !== 'undefined') {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        try {
-          const parsed = JSON.parse(stored) as ExtendedUser;
-          // Validate that the stored user exists in mockUsers
-          const validUser = mockUsers.find(u => u.id === parsed.id);
-          if (validUser) return validUser;
-        } catch {
-          // Invalid stored data, fall through to default
-        }
-      }
-    }
-    return getDefaultUser();
-  });
+  // Main user state
+  const [currentUser, setCurrentUserState] = useState<ExtendedUser | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  
+  // Impersonation state
+  const [isImpersonating, setIsImpersonating] = useState(false);
+  const [originalUser, setOriginalUser] = useState<ExtendedUser | null>(null);
 
-  const setCurrentUser = useCallback((user: ExtendedUser) => {
-    setCurrentUserState(user);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(user));
-    // Trigger a storage event for cross-tab synchronization
-    window.dispatchEvent(new StorageEvent('storage', {
-      key: STORAGE_KEY,
-      newValue: JSON.stringify(user),
-    }));
-  }, []);
-
-  // Listen for storage changes from other tabs
+  // Initialize from localStorage on mount
   useEffect(() => {
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key === STORAGE_KEY && e.newValue) {
-        try {
-          const parsed = JSON.parse(e.newValue) as ExtendedUser;
+    if (typeof window !== 'undefined') {
+      try {
+        // Load impersonation state first
+        const storedImpersonating = localStorage.getItem(STORAGE_KEY_IMPERSONATING);
+        if (storedImpersonating) {
+          const parsed: ImpersonationState = JSON.parse(storedImpersonating);
+          if (parsed.isImpersonating && parsed.originalUser) {
+            // Validate original user exists
+            const validOriginal = mockUsers.find(u => u.id === parsed.originalUser?.id);
+            if (validOriginal && validOriginal.permissions.impersonateUsers) {
+              setOriginalUser(validOriginal);
+              setIsImpersonating(true);
+            }
+          }
+        }
+
+        // Load current user
+        const storedUser = localStorage.getItem(STORAGE_KEY_USER);
+        if (storedUser) {
+          const parsed = JSON.parse(storedUser) as ExtendedUser;
           const validUser = mockUsers.find(u => u.id === parsed.id);
           if (validUser) {
             setCurrentUserState(validUser);
           }
-        } catch {
-          // Ignore invalid data
         }
+      } catch {
+        // Invalid stored data, ignore
       }
-    };
-
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
+      setIsLoading(false);
+    }
   }, []);
 
-  const isManager = useMemo(() => currentUser.role === 'manager', [currentUser.role]);
+  // Persist current user to localStorage
+  const persistUser = useCallback((user: ExtendedUser | null) => {
+    if (user) {
+      localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(user));
+    } else {
+      localStorage.removeItem(STORAGE_KEY_USER);
+    }
+  }, []);
 
+  // Persist impersonation state
+  const persistImpersonation = useCallback((state: ImpersonationState) => {
+    if (state.isImpersonating && state.originalUser) {
+      localStorage.setItem(STORAGE_KEY_IMPERSONATING, JSON.stringify(state));
+    } else {
+      localStorage.removeItem(STORAGE_KEY_IMPERSONATING);
+    }
+  }, []);
+
+  // Login function
+  const login = useCallback(async (email: string, password: string): Promise<boolean> => {
+    const user = authenticateUser(email, password);
+    if (user) {
+      setCurrentUserState(user);
+      persistUser(user);
+      // Clear any previous impersonation on fresh login
+      setIsImpersonating(false);
+      setOriginalUser(null);
+      persistImpersonation({ isImpersonating: false, originalUser: null });
+      return true;
+    }
+    return false;
+  }, [persistUser, persistImpersonation]);
+
+  // Logout function
+  const logout = useCallback(() => {
+    setCurrentUserState(null);
+    setIsImpersonating(false);
+    setOriginalUser(null);
+    persistUser(null);
+    persistImpersonation({ isImpersonating: false, originalUser: null });
+  }, [persistUser, persistImpersonation]);
+
+  // Impersonate another user (only for super_admin)
+  const impersonate = useCallback((userId: string): boolean => {
+    // Must be logged in and have impersonation permission
+    if (!currentUser || !currentUser.permissions.impersonateUsers) {
+      return false;
+    }
+
+    const targetUser = getUserById(userId);
+    if (!targetUser) {
+      return false;
+    }
+
+    // Can't impersonate yourself
+    if (targetUser.id === currentUser.id) {
+      return false;
+    }
+
+    // Save original user if not already impersonating
+    if (!isImpersonating) {
+      setOriginalUser(currentUser);
+      persistImpersonation({ isImpersonating: true, originalUser: currentUser });
+    }
+
+    setCurrentUserState(targetUser);
+    persistUser(targetUser);
+    setIsImpersonating(true);
+    
+    return true;
+  }, [currentUser, isImpersonating, persistUser, persistImpersonation]);
+
+  // Stop impersonating and return to original user
+  const stopImpersonating = useCallback(() => {
+    if (originalUser && isImpersonating) {
+      setCurrentUserState(originalUser);
+      persistUser(originalUser);
+      setIsImpersonating(false);
+      setOriginalUser(null);
+      persistImpersonation({ isImpersonating: false, originalUser: null });
+    }
+  }, [originalUser, isImpersonating, persistUser, persistImpersonation]);
+
+  // Check if current user has a specific permission
+  const hasPermission = useCallback((permission: keyof Permissions): boolean => {
+    if (!currentUser) return false;
+    return currentUser.permissions[permission] === true;
+  }, [currentUser]);
+
+  // Check if current user can impersonate others
+  const canImpersonate = useCallback((): boolean => {
+    if (!currentUser) return false;
+    return currentUser.permissions.impersonateUsers === true;
+  }, [currentUser]);
+
+  // Role checks - only 3 roles: super_admin, manager, loan_officer
+  const isSuperAdmin = useMemo(() => currentUser?.role === 'super_admin', [currentUser]);
+  const isManager = useMemo(() => currentUser?.role === 'manager', [currentUser]);
+  const isLoanOfficer = useMemo(() => currentUser?.role === 'loan_officer', [currentUser]);
+
+  // Derived state
+  const isAuthenticated = useMemo(() => currentUser !== null, [currentUser]);
+
+  // Context value
   const value = useMemo(() => ({
     currentUser,
-    setCurrentUser,
+    isAuthenticated,
+    isImpersonating,
+    originalUser,
+    login,
+    logout,
+    impersonate,
+    stopImpersonating,
+    hasPermission,
+    canImpersonate,
+    isSuperAdmin,
     isManager,
+    isLoanOfficer,
     availableUsers: mockUsers,
-  }), [currentUser, setCurrentUser, isManager]);
+  }), [
+    currentUser, 
+    isAuthenticated, 
+    isImpersonating, 
+    originalUser,
+    login, 
+    logout, 
+    impersonate, 
+    stopImpersonating,
+    hasPermission,
+    canImpersonate,
+    isSuperAdmin,
+    isManager,
+    isLoanOfficer,
+ ]);
+
+  if (isLoading) {
+    // You could return a loading spinner here
+    return null;
+  }
 
   return (
     <UserContext.Provider value={value}>

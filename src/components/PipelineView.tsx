@@ -45,7 +45,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { useUser } from '@/context/UserContext';
-import { mockUsers } from '@/mocks/users';
+import { mockUsers, getUserById, getRoleDisplayName } from '@/mocks/users';
 import { PipelineTabs, type PipelineViewType } from '@/components/PipelineTabs';
 import type { Loan, LoanStatus, Task, AIGoal } from '@/types';
 
@@ -81,7 +81,7 @@ const loanPurposeLabels: Record<string, string> = {
 // Get user name by ID
 const getUserNameById = (userId?: string): string => {
   if (!userId) return 'Unassigned';
-  const user = mockUsers.find(u => u.id === userId);
+  const user = getUserById(userId);
   return user?.name || 'Unknown';
 };
 
@@ -95,7 +95,7 @@ export function PipelineView({
   onCreateAIGoal,
   onAssignLoan
 }: PipelineViewProps) {
-  const { currentUser, isManager } = useUser();
+  const { currentUser, hasPermission, isImpersonating } = useUser();
   const [activeView, setActiveView] = useState<PipelineViewType>('my');
   const [selectedLoans, setSelectedLoans] = useState<string[]>([]);
   const [filterStatus, setFilterStatus] = useState<string>('all');
@@ -104,20 +104,37 @@ export function PipelineView({
   const [activeStatFilter, setActiveStatFilter] = useState<string | null>(null);
   const [assignDialogOpen, setAssignDialogOpen] = useState(false);
 
-  // Redirect non-managers trying to access department view
+  // Redirect if trying to access department view without permission
   useEffect(() => {
-    if (activeView === 'department' && !isManager) {
+    if (activeView === 'department' && !hasPermission('viewDepartmentPipeline')) {
       setActiveView('my');
     }
-  }, [activeView, isManager]);
+  }, [activeView, hasPermission]);
 
-  // Filter loans based on active view
+  // Filter loans based on active view and impersonation
   const viewLoans = useMemo(() => {
+    if (!currentUser) return [];
+
     if (activeView === 'my') {
-      return loans.filter(l => l.assignedTo === currentUser.id);
+      // If impersonating, show loans of the impersonated user
+      // Otherwise show current user's loans
+      const userId = currentUser.id;
+      const user = getUserById(userId);
+      
+      // If user has assignedLoans, use those
+      if (user?.assignedLoans && user.assignedLoans.length > 0) {
+        return loans.filter(l => user.assignedLoans?.includes(l.id));
+      }
+      
+      // Fallback to assignedTo field
+      return loans.filter(l => l.assignedTo === userId);
     } else {
       // Department view - show all loans in the same department
-      return loans.filter(l => l.departmentId === currentUser.department);
+      const dept = currentUser.department;
+      if (dept === 'all') {
+        return loans;
+      }
+      return loans.filter(l => l.departmentId === dept);
     }
   }, [loans, activeView, currentUser]);
 
@@ -239,15 +256,21 @@ export function PipelineView({
     setSelectedLoans([]);
   };
 
+  if (!currentUser) return null;
+
   return (
     <div className="space-y-6">
       {/* Header with Tabs */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-blue-950">Pipeline</h1>
+          <h1 className="text-2xl font-bold text-blue-950">
+            {isImpersonating ? `${currentUser.name}'s Pipeline` : 'Pipeline'}
+          </h1>
           <p className="text-slate-500">
             {activeView === 'my' 
-              ? 'Manage and track your loan applications' 
+              ? isImpersonating 
+                ? `Viewing loans assigned to ${currentUser.name}`
+                : 'Manage and track your loan applications'
               : 'View all loans in your department'}
           </p>
         </div>
@@ -548,7 +571,7 @@ export function PipelineView({
                           <DropdownMenuItem onClick={() => onLoanClick(loan)}>View Details</DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuLabel>Assign To</DropdownMenuLabel>
-                          {mockUsers.map(user => (
+                          {mockUsers.filter(u => u.role !== 'super_admin').map(user => (
                             <DropdownMenuItem 
                               key={user.id} 
                               onClick={() => onAssignLoan?.(loan.id, user.id)}
@@ -655,7 +678,7 @@ export function PipelineView({
               Assign {selectedLoans.length} selected loan{selectedLoans.length > 1 ? 's' : ''} to:
             </p>
             <div className="space-y-2">
-              {mockUsers.map((user) => (
+              {mockUsers.filter(u => u.role !== 'super_admin').map((user) => (
                 <button
                   key={user.id}
                   onClick={() => handleAssignUser(user.id)}
@@ -668,7 +691,7 @@ export function PipelineView({
                   </div>
                   <div className="flex-1">
                     <p className="font-medium text-slate-900">{user.name}</p>
-                    <p className="text-xs text-slate-500 capitalize">{user.role.replace('_', ' ')}</p>
+                    <p className="text-xs text-slate-500 capitalize">{getRoleDisplayName(user.role)}</p>
                   </div>
                   <Check className="w-5 h-5 text-slate-300" />
                 </button>
